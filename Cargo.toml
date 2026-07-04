@@ -1,9 +1,9 @@
 [package]
 name = "rp2040_temp_fan_ctrl"
-version = "0.1.0"
-edition = "2021"
-homepage = "https://github.com/rp-rs/rp-hal"
-description = "A Rust Embeded-HAL impl for the rp2040 microcontroller"
+version = "0.2.0"
+edition = "2024"
+homepage = "https://github.com/jepomeroy/rp2040_temp_fan_ctrl"
+description = "A Rust Embassy impl for the rp2040 microcontroller monitoring average temps and controlling fans"
 license = "MIT OR Apache-2.0"
 
 [package.metadata.docs.rs]
@@ -11,13 +11,22 @@ features = ["rt", "rom-v2-intrinsics", "defmt", "rtic-monotonic"]
 targets = ["thumbv6m-none-eabi"]
 
 [dependencies]
-cortex-m = "0.7.2"
-cortex-m-rt = ">=0.6.15, <0.8"
-embedded-hal = { version = "0.2.5", features = ["unproven"] }
-eh1_0_alpha = { package = "embedded-hal", version = "=1.0.0-alpha.9",  optional = true }
-rp2040-hal = "0.6.0"
-rp2040-boot2 = "0.2.1"
-panic-halt = "0.2.0"
-fugit = "0.3.6"
-lcd-lcm1602-i2c = "0.1.0"
-libm = "0.2.6"
+embassy-embedded-hal = { version = "0.6.0", features = ["defmt"] }
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+    "defmt",
+] }
+embassy-rp = { version = "0.10.0", features = ["defmt", "rp2040", "time-driver"] }
+embassy-usb = { version = "0.6.0", features = ["defmt"] }
+
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+static_cell = "2.1.1"
+portable-atomic = { version = "1", features = ["critical-section"] }
+embassy-time = "0.5.1"
+embassy-time-driver = "0.2.2"

@@ -1,173 +1,168 @@
-//! # Control fans for a Raspberry Pi cluster
-//!
-//! This application uses a Raspberry pico to measure temperature and a relay to control fans
-//!
-//! It may need to be adapted to your particular board layout and/or pin assignment.
-//!
-//! See the `Cargo.toml` file for Copyright and license details.
-
-// Code based on:
-// https://how2electronics.com/read-temperature-sensor-value-from-raspberry-pi-pico/
-// https://docs.sunfounder.com/projects/thales-kit/en/latest/thermometer.html
-//
-
 #![no_std]
 #![no_main]
 
-// (Uncomment for LCD)
-// mod write_to;
-// use crate::write_to::write_to::show;
+use defmt::{info, unwrap};
+use embassy_executor::Spawner;
+use embassy_rp::{
+    bind_interrupts,
+    gpio::{Level, Output},
+    peripherals::USB,
+    usb::{Driver, Instance, InterruptHandler},
+};
+use embassy_time::{Duration, Instant, Timer};
+use embassy_usb::{
+    UsbDevice,
+    class::cdc_acm::{CdcAcmClass, State},
+    driver::EndpointError,
+};
+use static_cell::StaticCell;
+use {defmt_rtt as _, panic_probe as _};
 
-// Ensure we halt the program on panic
-use panic_halt as _;
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => InterruptHandler<USB>;
+});
 
-// Some traits we need
-use embedded_hal::adc::OneShot;
-use embedded_hal::digital::v2::OutputPin;
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    info!("Starting...");
 
-// (Uncomment for LCD)
-// use fugit::RateExtU32;
+    let p = embassy_rp::init(Default::default());
 
-// Alias for our HAL crate
-use rp2040_hal as hal;
+    let mut led = Output::new(p.PIN_25, Level::Low);
 
-// A shorter alias for the Peripheral Access Crate, which provides low-level
-// register access
-use hal::{pac, Clock};
+    // Create the driver, from the HAL.
+    let driver = Driver::new(p.USB, Irqs);
 
-/// The linker will place this boot block at the start of our program image. We
-/// need this to help the ROM boot loader get our code up and running.
-/// Note: This boot block is not necessary when using a rp-hal based BSP
-/// as the BSPs already perform this step.
-#[link_section = ".boot2"]
-#[used]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_GENERIC_03H;
+    // Create embassy-usb Config
+    let config = {
+        let mut config = embassy_usb::Config::new(0xffff, 0xffff);
+        config.manufacturer = Some("JPLabs");
+        config.product = Some("USB-serial fan controller");
+        config.serial_number = Some("DEADBEEF");
+        config.max_power = 100;
+        config.max_packet_size_0 = 64;
+        config
+    };
 
-/// External high-speed crystal on the Raspberry Pi Pico board is 12 MHz. Adjust
-/// if your board has a different frequency
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
+    // Create embassy-usb DeviceBuilder using the driver and config.
+    // It needs some buffers for building the descriptors.
+    let mut builder = {
+        static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 
-/// Entry point to our bare-metal application.
-///
-/// The `#[rp2040_hal::entry]` macro ensures the Cortex-M start-up code calls this function
-/// as soon as all global variables and the spin lock are initialized.
-///
-/// The function configures the RP2040 peripherals, then performs a single I²C
-/// write to a fixed address.
-#[rp2040_hal::entry]
-fn main() -> ! {
-    let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
+        embassy_usb::Builder::new(
+            driver,
+            config,
+            CONFIG_DESCRIPTOR.init([0; 256]),
+            BOS_DESCRIPTOR.init([0; 256]),
+            &mut [], // no msos descriptors
+            CONTROL_BUF.init([0; 64]),
+        )
+    };
 
-    // Set up the watchdog driver - needed by the clock setup code
-    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+    // Create classes on the builder.
+    let mut class = {
+        static STATE: StaticCell<State> = StaticCell::new();
+        let state = STATE.init(State::new());
+        CdcAcmClass::new(&mut builder, state, 64)
+    };
 
-    // Configure the clocks
-    let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .ok()
-    .unwrap();
+    // Build the builder.
+    let usb = builder.build();
 
-    // The single-cycle I/O block controls our GPIO pins
-    let sio = hal::Sio::new(pac.SIO);
+    // Run the USB device.
+    spawner.spawn(unwrap!(usb_task(usb)));
 
-    // Set the pins to their default state
-    let pins = hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
-    // Configure two pins as being I²C, not GPIO (Uncomment for LCD)
-    // let sda_pin = pins.gpio4.into_mode::<hal::gpio::FunctionI2C>();
-    // let scl_pin = pins.gpio5.into_mode::<hal::gpio::FunctionI2C>();
-
-    let mut fan_ctrl_pin = pins.gpio6.into_push_pull_output();
-
-    // Enable ADC
-    let mut adc = hal::Adc::new(pac.ADC, &mut pac.RESETS);
-
-    // Enable the temperature sense channel
-    let mut temperature_sensor = pins.gpio28.into_floating_input();
-
-    // Create the I²C drive, using the two pre-configured pins. This will fail
-    // at compile time if the pins are in the wrong mode, or if this I²C
-    // peripheral isn't available on these pins!
-    // (Uncomment for LCD)
-    // let mut i2c = hal::I2C::i2c0(
-    //     pac.I2C0,
-    //     sda_pin,
-    //     scl_pin, // Try `not_an_scl_pin` here
-    //     400.kHz(),
-    //     &mut pac.RESETS,
-    //     &clocks.system_clock,
-    // );
-
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
-    // (Uncomment for LCD)
-    // let mut lcd = lcd_lcm1602_i2c::Lcd::new(&mut i2c, &mut delay)
-    //     .address(0x27)
-    //     .cursor_on(false) // no visible cursors
-    //     .rows(2) // two rows
-    //     .init()
-    //     .unwrap();
-
-    // The 12-bit ADC pin reading is between 0 and 4096 for thermistor
-    let conversion_factor = 3.3 / 4096.0;
-    let resistor_val: f64 = 10000.0;
-    fan_ctrl_pin.set_low().unwrap();
-
-    // (Uncomment for LCD)
-    // lcd = lcd.init().unwrap();
-    // lcd.clear().unwrap();
-
+    // Do stuff with the class!
     loop {
-        // read 12-bit value and convert to some percentage of the 3.3v
-        let adc_temp_value: u16 = adc.read(&mut temperature_sensor).unwrap();
-        let voltage: f64 = adc_temp_value as f64 * conversion_factor;
-
-        let resistance = resistor_val * voltage / (3.3 - voltage);
-        // get temp kelvin
-        let temp_k = 1.0
-            / (((libm::log(resistance as f64 / resistor_val)) / 3950.0) + (1.0 / (273.15 + 25.0)));
-
-        // convert to Celsius
-        let temp = temp_k - 273.15;
-
-        // Set to 50 C for fans on. Use 25 C for testing with body temp.
-        if temp > 50.0 {
-            fan_ctrl_pin.set_high().unwrap();
-            // leave the fan on for one minutes before checking again
-            // Comment this out for LCD and the lcd_lcm1602_i2c takes ownership of the delay.
-            delay.delay_ms(60000);
-        } else {
-            fan_ctrl_pin.set_low().unwrap();
-
-            // Delay 15 seconds between measurements
-            // Comment this out for LCD and the lcd_lcm1602_i2c takes ownership of the delay.
-            delay.delay_ms(15000);
-        }
-
-        // (Uncomment for LCD)
-        // let mut buf = [0u8; 64];
-
-        // lcd.set_cursor(0, 0).unwrap();
-        // let output: &str = show(&mut buf, format_args!("Temp: {}", temp)).unwrap();
-        // lcd.write_str(output).unwrap();
-
-        // lcd.set_cursor(1, 0).unwrap();
-        // let output: &str = show(&mut buf, format_args!("Pin val: {}", adc_temp_value)).unwrap();
-        // lcd.write_str(output).unwrap();
+        class.wait_connection().await;
+        info!("Connected");
+        let _ = class.write_packet(b"CONNECTED\n").await;
+        let _ = echo(&mut class, &mut led).await;
+        info!("Disconnected");
     }
 }
 
-// End of file
+type MyUsbDriver = Driver<'static, USB>;
+type MyUsbDevice = UsbDevice<'static, MyUsbDriver>;
+
+#[embassy_executor::task]
+async fn usb_task(mut usb: MyUsbDevice) -> ! {
+    usb.run().await
+}
+
+struct Disconnected {}
+
+impl From<EndpointError> for Disconnected {
+    fn from(val: EndpointError) -> Self {
+        match val {
+            EndpointError::BufferOverflow => panic!("Buffer overflow"),
+            EndpointError::Disabled => Disconnected {},
+        }
+    }
+}
+
+static TARGET_TEMP: u8 = 45; // Turn on if any Pi goes over 45°C
+
+async fn echo<'d, T: Instance + 'd>(
+    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
+    led: &mut Output<'d>,
+) -> Result<(), Disconnected> {
+    let mut buf = [0; 64];
+    let mut last_update = Instant::now();
+    let mut current_max_temp = 0u8;
+    let mut fans_active = false;
+    let mut fan_start_time = Instant::now();
+    // let fan_run_duration = Duration::from_secs(5 * 60); // X = 5 minutes
+    let fan_run_duration = Duration::from_secs(5); // X = 5 seconds
+
+    loop {
+        let n = class.read_packet(&mut buf).await?;
+        let data = &buf[..n];
+
+        // Each packet is the rack temp in degrees Celsius, as an ASCII decimal string.
+        if let Ok(temp) = core::str::from_utf8(data)
+            .unwrap_or("")
+            .trim()
+            .parse::<u8>()
+        {
+            current_max_temp = temp;
+            last_update = Instant::now();
+        }
+
+        let was_active = fans_active;
+
+        // --- Safety Timeout Check ---
+        if Instant::now().duration_since(last_update) > Duration::from_secs(60) {
+            // Master Pi hasn't talked to us in 60 seconds! Failsafe mode.
+            led.set_high();
+            fans_active = true;
+        } else if current_max_temp > TARGET_TEMP && !fans_active {
+            // --- Normal Fan Logic ---
+            led.set_high();
+            fans_active = true;
+            fan_start_time = Instant::now();
+        } else if fans_active && Instant::now().duration_since(fan_start_time) >= fan_run_duration {
+            // X minutes have elapsed, check if cool enough to turn off
+            if current_max_temp <= TARGET_TEMP {
+                led.set_low();
+                fans_active = false;
+            } else {
+                // Still too hot, reset the timer for another X minutes
+                fan_start_time = Instant::now();
+            }
+        }
+
+        if fans_active != was_active {
+            let event: &[u8] = if fans_active {
+                b"FAN_ON\n"
+            } else {
+                b"FAN_OFF\n"
+            };
+            class.write_packet(event).await?;
+        }
+
+        Timer::after(Duration::from_millis(1000)).await;
+    }
+}
