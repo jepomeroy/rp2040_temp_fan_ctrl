@@ -3,6 +3,7 @@
 
 use defmt::{info, unwrap};
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_rp::{
     bind_interrupts,
     gpio::{Level, Output},
@@ -29,6 +30,7 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut led = Output::new(p.PIN_25, Level::Low);
+    let mut fan_pin = Output::new(p.PIN_6, Level::Low);
 
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USB, Irqs);
@@ -79,7 +81,7 @@ async fn main(spawner: Spawner) {
         class.wait_connection().await;
         info!("Connected");
         let _ = class.write_packet(b"CONNECTED\n").await;
-        let _ = echo(&mut class, &mut led).await;
+        let _ = control_fan(&mut class, &mut led, &mut fan_pin).await;
         info!("Disconnected");
     }
 }
@@ -105,30 +107,43 @@ impl From<EndpointError> for Disconnected {
 
 static TARGET_TEMP: u8 = 45; // Turn on if any Pi goes over 45°C
 
-async fn echo<'d, T: Instance + 'd>(
+async fn control_fan<'d, T: Instance + 'd>(
     class: &mut CdcAcmClass<'d, Driver<'d, T>>,
     led: &mut Output<'d>,
+    fan_pin: &mut Output<'d>,
 ) -> Result<(), Disconnected> {
     let mut buf = [0; 64];
     let mut last_update = Instant::now();
     let mut current_max_temp = 0u8;
     let mut fans_active = false;
     let mut fan_start_time = Instant::now();
-    // let fan_run_duration = Duration::from_secs(5 * 60); // X = 5 minutes
-    let fan_run_duration = Duration::from_secs(5); // X = 5 seconds
+    let fan_run_duration = Duration::from_secs(60); // X = 1 minute
+    // let fan_run_duration = Duration::from_secs(5); // X = 5 seconds for debugging
 
     loop {
-        let n = class.read_packet(&mut buf).await?;
-        let data = &buf[..n];
-
-        // Each packet is the rack temp in degrees Celsius, as an ASCII decimal string.
-        if let Ok(temp) = core::str::from_utf8(data)
-            .unwrap_or("")
-            .trim()
-            .parse::<u8>()
+        // Race the read against a 1-second tick so the safety timeout below
+        // still gets checked even when the host stops sending altogether.
+        match select(
+            class.read_packet(&mut buf),
+            Timer::after(Duration::from_millis(1000)),
+        )
+        .await
         {
-            current_max_temp = temp;
-            last_update = Instant::now();
+            Either::First(res) => {
+                let n = res?;
+                let data = &buf[..n];
+
+                // Each packet is the rack temp in degrees Celsius, as an ASCII decimal string.
+                if let Ok(temp) = core::str::from_utf8(data)
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<u8>()
+                {
+                    current_max_temp = temp;
+                    last_update = Instant::now();
+                }
+            }
+            Either::Second(_) => {}
         }
 
         let was_active = fans_active;
@@ -137,16 +152,19 @@ async fn echo<'d, T: Instance + 'd>(
         if Instant::now().duration_since(last_update) > Duration::from_secs(60) {
             // Master Pi hasn't talked to us in 60 seconds! Failsafe mode.
             led.set_high();
+            fan_pin.set_high();
             fans_active = true;
         } else if current_max_temp > TARGET_TEMP && !fans_active {
             // --- Normal Fan Logic ---
             led.set_high();
+            fan_pin.set_high();
             fans_active = true;
             fan_start_time = Instant::now();
         } else if fans_active && Instant::now().duration_since(fan_start_time) >= fan_run_duration {
             // X minutes have elapsed, check if cool enough to turn off
             if current_max_temp <= TARGET_TEMP {
                 led.set_low();
+                fan_pin.set_low();
                 fans_active = false;
             } else {
                 // Still too hot, reset the timer for another X minutes
@@ -162,7 +180,5 @@ async fn echo<'d, T: Instance + 'd>(
             };
             class.write_packet(event).await?;
         }
-
-        Timer::after(Duration::from_millis(1000)).await;
     }
 }
